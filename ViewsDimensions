@@ -1,0 +1,672 @@
+import clr
+import math
+
+clr.AddReference('RevitAPI')
+from Autodesk.Revit.DB import *
+import itertools
+
+clr.AddReference('RevitNodes')
+import Revit
+from Autodesk.Revit.Creation import *
+
+clr.ImportExtensions(Revit.GeometryConversion)
+clr.ImportExtensions(Revit.Elements)
+clr.AddReference('ProtoGeometry')
+import Autodesk
+
+DVector = Autodesk.DesignScript.Geometry.Vector
+clr.AddReference('RevitServices')
+import RevitServices
+from RevitServices.Persistence import DocumentManager
+from RevitServices.Transactions import TransactionManager
+from operator import itemgetter
+
+clr.AddReference("RevitAPIUI")
+import Autodesk
+from Autodesk.Revit.UI import *
+from Autodesk.Revit.UI.Selection import *
+
+uidoc = DocumentManager.Instance.CurrentUIApplication.ActiveUIDocument
+
+doc = DocumentManager.Instance.CurrentDBDocument
+
+datum = DatumExtentType.ViewSpecific
+opt = Options()
+opt.ComputeReferences = True
+opt.IncludeNonVisibleObjects = False
+# opt.View = view
+refcenterfrontback = FamilyInstanceReferenceType.CenterFrontBack
+refcenterleftright = FamilyInstanceReferenceType.CenterLeftRight
+refcentertopdown = FamilyInstanceReferenceType.CenterElevation
+
+# -------------------------------------------------
+ST = Autodesk.Revit.DB.Structure
+stype = ST.StructuralType.NonStructural
+# -----------Выбрать тип по имени типа------------------
+"""
+type1 = None
+types = FilteredElementCollector(doc).OfCategory(BuiltInCategory.OST_GenericAnnotation).WhereElementIsElementType().ToElements()
+for t in types:
+	name = t.get_Parameter(BuiltInParameter.ALL_MODEL_TYPE_NAME).AsString()
+	if t1 == name:
+		type1 = t
+"""
+
+
+def get_fam_name(el):
+    return el.get_Parameter(BuiltInParameter.ELEM_FAMILY_PARAM).AsValueString()
+
+
+def get_type_name(el):
+    return el.get_Parameter(BuiltInParameter.ELEM_TYPE_PARAM).AsValueString()
+
+
+def get_type_id(el):
+    return el.get_Parameter(BuiltInParameter.ELEM_TYPE_PARAM).AsElementId()
+
+
+def get_type_el(type_id):
+    return doc.GetElement(type_id)
+
+
+def get_solids(el):
+    geoms = el.get_Geometry(opt)
+    solids = []
+    for g in geoms:
+        type = g.GetType().Name
+        if type == "Solid":
+            solids.append(g)
+    return solids
+
+
+def get_g_lines(el):
+    geoms = el.get_Geometry(opt)
+    lines = []
+    for g in geoms:
+        # if isinstance(g, Line):
+        type = g.GetType().Name
+        if type == "Line":  # "GeometryInstance":
+            lines.append(g)
+    return lines
+
+
+def get_front_faces(solids, orient):
+    faces = []
+    for solid in solids:
+        fs = solid.Faces
+        if fs is not None:
+            for f in fs:
+                try:
+                    normal = f.FaceNormal
+                    if round(normal.X) == round(orient.X) and round(normal.Y) == -round(orient.Y):
+                        faces.append(f)
+                except:
+                    0
+    return faces
+
+
+def get_lines(faces):
+    lines = []
+    edges = []
+    for face in faces:
+        contours = face.EdgeLoops
+        for curves in contours:
+            for curve in curves:
+                line = curve.AsCurve()
+                d_curve = line.ToProtoType()
+                lines.append(line)
+                edges.append(curve)
+    return lines, edges
+
+
+def get_relative_coord(loc, orient1, pt2):
+    pt1 = loc
+    x1 = pt1.X
+    y1 = pt1.Y
+    z1 = pt1.Z
+    x2 = pt2.X
+    y2 = pt2.Y
+    z2 = pt2.Z
+    a = math.radians(get_angle(orient1))
+    dx = (x2 - x1) * math.cos(a) + (y2 - y1) * math.sin(a)
+    dy = -(x2 - x1) * math.sin(a) + (y2 - y1) * math.cos(a)
+    dz = z2 - z1
+    new_pt = XYZ(dx, dy, dz)
+    return new_pt
+
+
+def get_true_coord(loc, orient1, pt2):
+    pt1 = loc
+    x1 = pt1.X
+    y1 = pt1.Y
+    z1 = pt1.Z
+    dx = pt2.X
+    dy = pt2.Y
+    dz = pt2.Z
+    a = math.radians(get_angle(XYZ(orient1.X, orient1.Y, orient1.Z)))
+    x2 = dx * math.cos(a) - dy * math.sin(a) + x1
+    y2 = dx * math.sin(a) + dy * math.cos(a) + y1
+    z2 = dz + z1
+    new_pt = XYZ(x2, y2, z2)
+    return new_pt
+
+
+def get_angle(a):
+    x1 = a.X
+    y1 = a.Y
+    a1 = DVector.ByCoordinates(x1, y1, 0)
+    angle = 360 - DVector.AngleAboutAxis(a1, DVector.XAxis(), DVector.ZAxis())
+    return angle
+
+
+def get_relative_lines(lines, orient1):  # creates a line with relative pts
+    lines2 = []
+    edges2 = []
+    i = 0
+    for line in lines[0]:
+        pt1 = line.GetEndPoint(0)
+        pt2 = line.GetEndPoint(1)
+        new_pt1 = get_relative_coord(loc, orient1, pt1)
+        new_pt2 = get_relative_coord(loc, orient1, pt2)
+        new_line = Line.CreateBound(new_pt1, new_pt2)
+        lines2.append(new_line)  # .ToProtoType())
+        edges2.append(lines[1][i])
+        i = i + 1
+    return lines2, edges2
+
+
+def get_bottom_line(lines2):
+    bot_line = None
+    bot_edge = None
+    i = 0
+    min_Z = 10000
+    for line in lines2[0]:
+        pt1 = line.GetEndPoint(0)
+        pt2 = line.GetEndPoint(1)
+        if pt1.Z == pt2.Z and pt1.Z < min_Z:
+            min_Z = pt1.Z
+            bot_line = line
+            bot_edge = lines2[1][i]
+        i = i + 1
+    return bot_line, bot_edge
+
+
+def get_left_line(lines2):
+    left_line = None
+    left_edge = None
+    i = 0
+    min_x = 10000
+    for line in lines2[0]:
+        pt1 = line.GetEndPoint(0)
+        pt2 = line.GetEndPoint(1)
+        if pt1.X == pt2.X and pt1.X < min_x:
+            min_x = pt1.X
+            left_line = line
+            left_edge = lines2[1][i]
+        i = i + 1
+    return left_line, left_edge
+
+
+def get_right_line(lines2):
+    right_line = None
+    right_edge = None
+    i = 0
+    max_x = 0
+    for line in lines2[0]:
+        pt1 = line.GetEndPoint(0)
+        pt2 = line.GetEndPoint(1)
+        if round(pt1.X) == round(pt2.X) and pt1.X > max_x:
+            max_x = pt1.X
+            right_line = line
+            right_edge = lines2[1][i]
+        i = i + 1
+    return right_line, right_edge
+
+
+def get_top_line(lines2):
+    top_line = None
+    top_edge = None
+    i = 0
+    max_Z = -10000
+    for line in lines2[0]:
+        pt1 = line.GetEndPoint(0)
+        pt2 = line.GetEndPoint(1)
+        if round(pt1.Z) == round(pt2.Z) and pt1.Z > max_Z:
+            max_Z = pt1.Z
+            top_line = line
+            top_edge = lines2[1][i]
+        i = i + 1
+    return top_line, top_edge
+
+
+def get_vertical_lines(lines2):
+    lines = []
+    edges = []
+    i = 0
+    max_x = 0
+    list_x = []
+    for line in lines2[0]:
+        pt1 = line.GetEndPoint(0)
+        pt2 = line.GetEndPoint(1)
+        x1 = round(pt1.X, 2)
+        x2 = round(pt2.X, 2)
+        if x1 == x2 and lines2[1][i].ApproximateLength > 1 and x1 not in list_x:
+            lines.append(line)
+            edges.append(lines2[1][i])
+            list_x.append(x1)
+        i = i + 1
+    return lines, edges
+
+
+def get_refs(lines):
+    refs = ReferenceArray()
+    for line in lines:
+        try:
+            ref = line.Reference
+        except:
+            ref = line
+        refs.Append(ref)
+    return refs
+
+
+def create_dim_h(view, lines, dz):
+    refs = get_refs(lines[1])
+    y = lines[0][0].GetEndPoint(0).Y
+    pt1 = XYZ(-100, -y, dz / 304.8)
+    new_pt1 = get_true_coord(loc, orient1, pt1)
+    pt2 = XYZ(100, -y, dz / 304.8)
+    new_pt2 = get_true_coord(loc, orient1, pt2)
+    ln1 = Line.CreateBound(new_pt1, new_pt2)
+    dim = doc.Create.NewDimension(view, ln1, refs)
+    return dim
+
+
+def create_dim_hMOD(view, refs, dx, y):
+    pt1 = XYZ(-100, -y, dx / 304.8)
+    new_pt1 = get_true_coord(loc, orient1, pt1)
+    pt2 = XYZ(100, -y, dx / 304.8)
+    new_pt2 = get_true_coord(loc, orient1, pt2)
+    ln1 = Line.CreateBound(new_pt1, new_pt2)
+    dim = doc.Create.NewDimension(view, ln1, refs)
+    return dim
+
+
+def create_dim_v(view, refs, dx, y):
+    pt1 = XYZ(dx / 304.8, -y, -100)
+    new_pt1 = get_true_coord(loc, orient1, pt1)
+    pt2 = XYZ(dx / 304.8, -y, 100)
+    new_pt2 = get_true_coord(loc, orient1, pt2)
+    ln1 = Line.CreateBound(new_pt1, new_pt2)
+    dim = doc.Create.NewDimension(view, ln1, refs)
+    return dim
+
+
+def get_list_x(lines4, orient):
+    list_x = []
+    for line in lines[0]:
+        x = round(get_relative_coord(loc, orient1, line.GetEndPoint(0)).X, 2)
+        list_x.append(x)
+    return list_x
+
+
+def get_left_pt(edges):
+    refs = ReferenceArray()
+    uniq = []
+    for edge in edges:
+        pt1 = get_relative_coord(loc, orient1, edge.AsCurve().GetEndPoint(0))
+        pt2 = get_relative_coord(loc, orient1, edge.AsCurve().GetEndPoint(1))
+        x1 = round(pt1.X, 2)
+        x2 = round(pt2.X, 2)
+        z1 = round(pt1.Z, 2)
+        z2 = round(pt2.Z, 2)
+        if x1 < l / 2 and z1 not in uniq:
+            ref = edge.GetEndPointReference(0)
+            refs.Append(ref)
+            uniq.append(z1)
+        elif x2 < l / 2 and z2 not in uniq:
+            ref = edge.GetEndPointReference(1)
+            refs.Append(ref)
+            uniq.append(z2)
+    return refs, uniq
+
+
+def get_right_pt(edges):
+    refs = ReferenceArray()
+    uniq = []
+    for edge in edges:
+        pt1 = get_relative_coord(loc, orient1, edge.AsCurve().GetEndPoint(0))
+        pt2 = get_relative_coord(loc, orient1, edge.AsCurve().GetEndPoint(1))
+        x1 = round(pt1.X, 2)
+        x2 = round(pt2.X, 2)
+        z1 = round(pt1.Z, 2)
+        z2 = round(pt2.Z, 2)
+        if x1 > l / 2 and z1 not in uniq:
+            ref = edge.GetEndPointReference(0)
+            refs.Append(ref)
+            uniq.append(z1)
+        elif x2 > l / 2 and z2 not in uniq:
+            ref = edge.GetEndPointReference(1)
+            refs.Append(ref)
+            uniq.append(z2)
+    return refs, uniq
+
+
+def get_horizontal_edges(lines2):
+    lines = []
+    edges = []
+    i = 0
+    for line in lines2[0]:
+        pt1 = get_relative_coord(loc, orient1, line.GetEndPoint(0))
+        pt2 = get_relative_coord(loc, orient1, line.GetEndPoint(1))
+        z1 = round(pt1.Z, 2)
+        z2 = round(pt2.Z, 2)
+        if z1 == z2 and lines2[1][i].ApproximateLength > 1:
+            edges.append(lines2[1][i])
+        i = i + 1
+    return edges
+
+
+def create_bypoint(point, familytype, view):
+    el = doc.Create.NewFamilyInstance(point, familytype, view)
+    return el
+
+
+def move_pt(pt, x, y, z):
+    x1 = pt.X + x
+    y1 = pt.Y + y
+    z1 = pt.Z + z
+    pt2 = XYZ(x1, y1, z1)
+    return pt2
+
+
+def create_tags(view, elRefs, tagorn, dx, dz, els):
+    tags = []
+    for i, el in enumerate(els):
+        pt1 = el.Location.Point
+        a = -get_angle(el.HandOrientation)
+        pt = get_new_point(pt1, dx, 0, dz, 45)
+        pt2 = get_new_point(pt, -5 * 50 / 304.8, 0, 0, a)
+        # pt = move_pt(pt,0,0,dz) # ,view,el,0,tagMode,tagorn,pt
+        tag = IndependentTag.Create(doc, view.Id, elRefs[i], 1, tagMode, tagorn, pt)
+        tag.get_Parameter(BuiltInParameter.LEADER_LINE).Set(1)
+
+        tag.HasLeader = 1
+        # tag.LeaderElbow = pt2
+        tag.LeaderEndCondition = LeaderEndCondition.Free
+        tag.LeaderEnd = pt1
+        tag.TagHeadPosition = pt
+        tags.append(tag)
+    return tags
+
+
+def get_wall(part):
+    Wall = None
+    cond = True
+    k = 0
+    temp = part
+    while cond:
+        id = temp.GetSourceElementIds()[0].HostElementId
+        el = doc.GetElement(id)
+        temp = el
+        category = el.Category.Name
+        k += 1
+        if category == "Walls":
+            Wall = el
+            break
+        elif k > 100:
+            break
+    return Wall
+
+
+def WallOrientation(wall):
+    loc = wall.Location
+    flipped = False
+    if hasattr(loc, "Curve"):
+        lcurve = loc.Curve
+        if hasattr(wall, "Flipped"): flipped = wall.Flipped
+        if str(lcurve.GetType()) == "Autodesk.Revit.DB.Line":
+            if flipped:
+                return wall.Orientation.ToVector().Reverse()
+            else:
+                return wall.Orientation.ToVector()
+        else:
+            direction = (lcurve.GetEndPoint(1) - lcurve.GetEndPoint(0)).Normalize()
+            if flipped:
+                return XYZ.BasisZ.CrossProduct(direction).ToVector().Reverse()
+            else:
+                return XYZ.BasisZ.CrossProduct(direction).ToVector()
+    else:
+        return None
+
+
+def get_new_point(pt1, fx, fy, fz, a):
+    x1 = pt1.X
+    y1 = pt1.Y
+    x2 = x1 + (fx) * math.cos(math.radians(a)) - (fy) * math.sin(math.radians(a))
+    y2 = y1 + (fx) * math.sin(math.radians(a)) + (fy) * math.cos(math.radians(a))
+    z1 = pt1.Z + fz
+    pt2 = XYZ(x2, y2, z1)
+    return pt2
+
+
+# Create the dimension in a transaction
+Zaxis = XYZ(0, 0, 1)
+Imper = 304.8
+TransactionManager.Instance.EnsureInTransaction(doc)
+views = UnwrapElement(IN[0])
+
+if not hasattr(views, '__iter__'):
+    views = [views]
+for view in views:
+    asms = FilteredElementCollector(doc, view.Id).OfCategory(
+        BuiltInCategory.OST_Assemblies).WhereElementIsNotElementType().ToElements()
+    ids = asms[0].GetMemberIds()
+    list = []
+    panel = None
+    windows = []
+    doors = []
+    SABs = []
+    PMs = []
+    TVH = []
+    TFA = []
+    TSA = []
+    Parts = []
+
+    for id in ids:
+        el = doc.GetElement(id)
+        category = el.Category.Name
+        if category == "Walls":
+            panel = el
+        elif category == "Windows":
+            windows.append(el)
+        elif category == "Parts":
+            Parts.append(el)
+        else:
+            type = get_fam_name(el)
+            if "S_AB" in type:
+                SABs.append(el)
+            elif "PM1" in type:
+                PMs.append(el)
+            elif "TVH" in type:
+                TVH.append(el)
+    MaxVolume = 0
+    for p in Parts:
+        V = get_solids(p)[0].ToProtoType().Volume
+        if V > MaxVolume:
+            MaxVolume = V
+            cpart = p
+
+    panel = get_wall(cpart)
+    geoms = panel.get_Geometry(opt)
+    locCurve = panel.Location
+    Curve = locCurve.Curve
+    CurvLen = Curve.Length
+    loc = Curve.Origin
+    # panel = UnwrapElement(panel)
+    BBox = panel.get_BoundingBox(None)  # bounding box of wall
+    list = []
+    faces = []
+    orient = WallOrientation(panel)
+    orientXYZ = orient.ToXyz()
+    orient1 = orientXYZ.CrossProduct(Zaxis)
+    l = CurvLen  # *Imper
+    h = panel.LookupParameter("Unconnected Height").AsDouble()  # *Imper
+    t = panel.Width  # *Imper
+    #
+    lines = []
+    solids = get_solids(panel)
+    faces = get_front_faces(solids, orient)  # faces
+    lines = get_lines(faces)  # lines of front faces
+    lines2 = get_relative_lines(lines, orient1)  # lines acording to wall position
+
+    left = get_left_line(lines2)
+    right = get_right_line(lines2)
+    lines3 = [[left[0], right[0]], [left[1], right[1]]]
+
+    topL = get_top_line(lines2)
+    bottomL = get_bottom_line(lines2)
+    ToBo = [[topL[0], bottomL[0]], [topL[1], bottomL[1]]]
+    refs = get_refs(ToBo[1])
+
+    dim01 = create_dim_v(view, refs, l * 304.8 + 200, t / 2)
+    dim02 = create_dim_v(view, refs, - 200, t / 2)
+    dim1 = create_dim_h(view, lines3, h * Imper + 400)
+    lines4 = get_vertical_lines(lines2)
+    # dim2 = create_dim_h(view,lines4,h*Imper+400)
+
+    #
+    #
+    lines5 = lines4
+    lines6 = lines3
+    list_x = get_list_x(lines4, orient1)
+    list5_x = list_x  # X coords of vertica lines
+    list6_x = list_x  # X coords of vertica lines
+    ref = []
+    for el in SABs:
+        reftype = FamilyInstanceReferenceType.CenterFrontBack
+        z = el.get_Parameter(BuiltInParameter.INSTANCE_FREE_HOST_OFFSET_PARAM).AsDouble()
+        if reftype == None:
+            ref1 = el.GetReferences(FamilyInstanceReferenceType.StrongReference)  # [0]
+        else:
+            ref1 = el.GetReferences(reftype)[0]
+        ref.append(ref1)
+        if z < h / 2:
+            x = round(get_relative_coord(loc, orient1, el.Location.Point).X, 2)
+            if x not in list5_x:  # check if references does not coincide with edges one
+                list5_x.append(x)
+                lines5[0].append(None)
+                lines5[1].append(ref1)
+        else:
+            x = round(get_relative_coord(loc, orient1, el.Location.Point).X, 2)
+            if x not in list6_x:  # check if references does not coincide with edges one
+                list6_x.append(x)
+                lines6[0].append(None)
+                lines6[1].append(ref1)
+    #
+    dim3 = create_dim_h(view, lines5, h * Imper + 200)
+    # dim4 = create_dim_h(view,lines6,h*Imper+400)
+    #
+    #
+    #
+    h_edges = get_horizontal_edges(lines2)
+
+    refs1 = get_left_pt(h_edges)[0]
+    list1_z = get_left_pt(h_edges)[1]
+
+    refs2 = get_right_pt(h_edges)[0]
+    list2_z = get_right_pt(h_edges)[1]
+
+    ref_list = []
+    ref_LR = []
+    ref_TB = []
+    ZZZ = []
+    XXX = []
+
+    LeftEleRefs = ReferenceArray()
+    RightEleRefs = ReferenceArray()
+
+    for el in PMs:
+        reftypeT = FamilyInstanceReferenceType.Front  # top edge reference
+        refT = el.GetReferences(reftypeT)
+        reftypeB = FamilyInstanceReferenceType.Back  # bottom edge reference
+        refB = el.GetReferences(reftypeB)
+        reftypeL = FamilyInstanceReferenceType.Left
+        refL = el.GetReferences(reftypeL)
+        reftypeR = FamilyInstanceReferenceType.Right
+        refR = el.GetReferences(reftypeR)
+        #######			########
+        ref_LR.append([refL[0], refR[0]])
+        ref_TB.append([refT[0], refB[0]])
+        ref_list.append([refT[0], refB[0], refL[0], refR[0]])
+        # if ref.Count>0:
+        # ref=ref[0]
+        x = round(get_relative_coord(loc, orient1, el.Location.Point).X, 2)
+        Z = round(get_relative_coord(loc, orient1, el.Location.Point).Z, 2)
+        XXX.append(Z)
+        z_coord = round(get_relative_coord(loc, orient1, el.Location.Point).Z + 75 / Imper, 2)
+        z_coord1 = round(get_relative_coord(loc, orient1, el.Location.Point).Z - 75 / Imper, 2)
+
+        z = el.get_Parameter(BuiltInParameter.INSTANCE_FREE_HOST_OFFSET_PARAM).AsDouble()
+        ZZZ.append(z_coord);
+        ZZZ.append(z_coord1)
+
+        if x < l / 2 and (z_coord not in list1_z or z_coord1 not in list1_z):
+            LeftEleRefs.Append(refT[0])
+            LeftEleRefs.Append(refB[0])
+        # list1_z.append(z)
+        # refs1.Append(refT[0])
+        # refs1.Append(refB[0])
+        else:
+            RightEleRefs.Append(refT[0])
+            RightEleRefs.Append(refB[0])
+            list1_z.append(z)
+        # refs2.Append(refT[0])
+        # refs2.Append(refB[0])
+
+    flatten = lambda l: [item for sublist in l for item in sublist]
+
+    GH = {}
+    for i in set(XXX):
+        GH.setdefault(str(i), [])
+        for jj, j in enumerate(XXX):
+            if j == i:
+                GH[str(i)].append(ref_LR[jj])
+
+    dZ = 0
+    LREdges = get_refs(lines3[1])
+    for i in GH:
+        A = ReferenceArray()
+        a = flatten(GH[i])
+        [A.Append(o) for o in a]
+        for LR in LREdges:
+            A.Append(LR)
+        dim55 = create_dim_hMOD(view, A, -200 + dZ, t / 2)
+        dZ -= 200
+
+    dim6 = create_dim_v(view, refs1, l * 304.8 / 2 - 400, t / 2)
+    dim7 = create_dim_v(view, LeftEleRefs, 700, t / 2)
+    dim8 = create_dim_v(view, RightEleRefs, l * 304.8 - 700, t / 2)
+    TransactionManager.Instance.TransactionTaskDone()
+
+    ##	#-----------Generic models labels----------------
+
+    tagMode = TagMode.TM_ADDBY_CATEGORY
+    tagorn = TagOrientation.Horizontal
+    #####Create the dimension in a transaction
+    TransactionManager.Instance.EnsureInTransaction(doc)
+
+    dx = 10 * 50 / Imper
+    dz = 5 * 50 / Imper
+    if len(TVH) > 0:
+        TVH_refs = [Reference(TVH[0])]
+        tags = create_tags(view, TVH_refs, tagorn, dx, dz, TVH)
+    if len(SABs) > 0:
+        SABs_refs = [Reference(i) for i in SABs]
+        tags = create_tags(view, SABs_refs, tagorn, dx, dz, SABs)
+    if len(PMs) > 0:
+        PMs_refs = [Reference(i) for i in PMs]
+        tags = create_tags(view, PMs_refs, tagorn, dx, dz, PMs)
+
+    TransactionManager.Instance.TransactionTaskDone()
+
+OUT = 1  # TVH,TVH_refs  #dim6 #dim1,dim2,dim3,dim4,dim6,dim7,tags
